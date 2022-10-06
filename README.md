@@ -1,4 +1,4 @@
-# Architectury Loom based template for 1.8.9 forge mods
+ Architectury Loom based template for 1.8.9 kotlin forge mods
 
 **For other templates, do check out the [other branches of this repository](https://github.com/romangraef/Forge1.8.9Template/branches/all)**
 
@@ -16,6 +16,9 @@ The `com.example` package needs to be renamed to match the value of `baseGroup`.
 
 If you don't want mixins (which allow for modifying vanilla code), then you can remove the references to mixins from
 the `build.gradle.kts` at the lines specified with comments and the `com.example.mixin` package.
+
+Please note that Mixins should be kept in their own package, and should exclusively be written in Java, since older versions
+of Mixin don't play well with Kotlin.
 
 This project uses [DevAuth](https://github.com/DJtheRedstoner/DevAuth) per default, so you can log in using your real
 minecraft account. If you don't need that, you can remove it from the buildscript.
