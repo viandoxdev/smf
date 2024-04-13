@@ -1,8 +1,7 @@
 package dev.vndx
 
 import dev.vndx.bindings.loadNativeLibrary
-import net.minecraft.client.Minecraft
-import net.minecraft.init.Blocks
+import dev.vndx.bindings.test_jni
 import net.minecraftforge.fml.common.Mod
 import net.minecraftforge.fml.common.event.FMLInitializationEvent
 import org.apache.logging.log4j.LogManager
@@ -15,5 +14,7 @@ class SMF {
         val logger = LogManager.getLogger()
 
         loadNativeLibrary(logger)
+
+        logger.info("JNI: ${test_jni("Test String from Kotlin")}")
     }
 }
