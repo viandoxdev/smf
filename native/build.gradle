@@ -1,0 +1,113 @@
+plugins {
+    id 'io.github.arc-blroth.cargo-wrapper' version '1.1.0'
+}
+
+repositories {
+    mavenCentral()
+}
+
+import ai.arcblroth.cargo.CargoExtension
+import ai.arcblroth.cargo.CargoTask
+import com.google.common.collect.ImmutableMap
+import com.google.common.collect.ImmutableSet
+
+import java.nio.file.DirectoryStream
+import java.nio.file.Files
+import java.security.MessageDigest
+import java.util.regex.Pattern
+
+Map.Entry<String, TaskProvider<? extends Task>> registerCrossBuildTask(String taskName, String targetName, String dllName) {
+    def cargoTask = tasks.register(taskName + ".cargo", CargoTask) {
+        def configuration = new CargoExtension()
+        // Not needed for now:
+        // configuration.cargoCommand = 'cross'
+        configuration.arguments = ['--target', targetName]
+        configuration.outputs = [(targetName): dllName]
+        configuration.profile = 'release'
+        configure(configuration)
+        dependsOn(getTasksByName("build", false))
+    }
+    def copyTask = tasks.register(taskName, Copy) {
+        dependsOn cargoTask
+        def task = cargoTask.get()
+        from(task.outputFiles) {
+            rename(name -> "$targetName-" + name)
+        }
+        into "build/natives/"
+    }
+    Map.entry(targetName, copyTask)
+}
+
+def cargoCrossBuildTasks = ImmutableMap.copyOf([
+        registerCrossBuildTask('compileWindowsLibrary', 'x86_64-pc-windows-gnu', 'smf.dll'),
+        registerCrossBuildTask('compileLinuxLibrary', 'x86_64-unknown-linux-gnu', 'libsmf.so'),
+])
+
+cargo {
+    cargoCommand = 'cargo'
+    outputs = ['': System.mapLibraryName('smf')]
+    profile = 'release'
+}
+
+def copyHostPlatformNative = tasks.register('copyHostPlatformNative', Copy) {
+    dependsOn build
+    mustRunAfter(cargoCrossBuildTasks.values())
+    def hostTarget = new ByteArrayOutputStream().withStream { outputStream ->
+        project.exec {
+            commandLine 'rustc', '-vV'
+            standardOutput = outputStream
+        }
+        def output = outputStream.toString()
+        def matcher = Pattern.compile("^host: (.*)\$", Pattern.MULTILINE).matcher(output)
+        matcher.find()
+        def platform = matcher.group(1)
+        println("Platform is $platform")
+        platform
+    }
+    from(build.outputFiles) {
+        rename(name -> "$hostTarget-" + name)
+    }
+    into "build/natives/"
+}
+
+def createFileDigests = tasks.register('createFileDigests') {
+    dependsOn copyHostPlatformNative
+    inputs.dir("build/natives")
+    outputs.file("build/checksum/checksums.txt")
+    outputs.files.singleFile.parentFile.mkdirs()
+    try (def output = new FileWriter(outputs.files.singleFile)) {
+        for (File file : inputs.files.asFileTree.files) {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256")
+            byte[] contents = file.bytes
+            digest.update(contents)
+            String digestStr = Base64.encoder.encodeToString(digest.digest())
+            output.write("" + file.name + "\t" + contents.length + "\t" + digestStr + "\n")
+        }
+    }
+}
+
+afterEvaluate {
+    def additionalTargetsStr = System.getProperty("dev.vndx.smf.additionalTargets");
+    Set<String> additionalTargets = ImmutableSet.of()
+    if (additionalTargetsStr != null) {
+        additionalTargets = new HashSet<>(Arrays.asList(additionalTargetsStr.split(",")))
+    }
+
+    def addedTargets = [];
+    for (def e : cargoCrossBuildTasks) {
+        if (additionalTargets.contains(e.key)) {
+            artifacts.add('default', e.value)
+            addedTargets.add(e.key)
+        }
+    }
+    if (!addedTargets.isEmpty()) {
+        additionalTargets.removeAll(addedTargets)
+    }
+
+    if (!additionalTargets.isEmpty()) {
+        throw new GradleException("Unknown targets: " + additionalTargets)
+    }
+
+    artifacts.add('default', copyHostPlatformNative)
+    artifacts.add('default', createFileDigests)
+}

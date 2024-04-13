@@ -1,4 +1,7 @@
 import org.apache.commons.lang3.SystemUtils
+import org.jetbrains.kotlin.gradle.plugin.KotlinPlatformType
+import java.io.ByteArrayOutputStream
+import java.util.regex.Pattern
 
 plugins {
     idea
@@ -75,10 +78,33 @@ val shadowImpl: Configuration by configurations.creating {
     configurations.implementation.get().extendsFrom(this)
 }
 
+val common by configurations.creating
+val shadowCommon by configurations.creating
+val backend by configurations.creating {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+}
+
+configurations {
+    compileClasspath {
+        extendsFrom(common)
+    }
+    runtimeClasspath {
+        extendsFrom(common)
+    }
+    create("developmentForge") {
+        extendsFrom(common)
+    }
+}
+
 dependencies {
     minecraft("com.mojang:minecraft:1.8.9")
     mappings("de.oceanlabs.mcp:mcp_stable:22-1.8.9")
     forge("net.minecraftforge:forge:1.8.9-11.15.1.2318-1.8.9")
+
+    //common(project(path = ":native", configuration = "namedElements"))
+    //shadowCommon(project(path = ":native", configuration = "transformProductionForge"))
+    backend(project("native"))
 
     shadowImpl(kotlin("stdlib-jdk8"))
 
@@ -90,10 +116,22 @@ dependencies {
 
     // If you don't want to log in with your real minecraft account, remove this line
     runtimeOnly("me.djtheredstoner:DevAuth-forge-legacy:1.1.2")
-
 }
 
 // Tasks:
+
+val identifyHostRustcPlatform = tasks.register<Exec>("identifyRustcHostPlatform") {
+    commandLine("rustc", "-vV")
+    standardOutput = ByteArrayOutputStream()
+    ext.set("output", {
+        val output = standardOutput.toString()
+        val matcher = Pattern.compile("^host: (.*)\$", Pattern.MULTILINE).matcher(output)
+        matcher.find()
+        val platform = matcher.group(1)
+        println("Platform is $platform")
+        platform
+    })
+}
 
 tasks.withType(JavaCompile::class) {
     options.encoding = "UTF-8"
@@ -112,6 +150,8 @@ tasks.withType(Jar::class) {
 }
 
 tasks.processResources {
+    dependsOn(identifyHostRustcPlatform)
+
     inputs.property("version", project.version)
     inputs.property("mcversion", mcVersion)
     inputs.property("modid", modid)
@@ -122,6 +162,16 @@ tasks.processResources {
     }
 
     rename("(.+_at.cfg)", "META-INF/$1")
+
+    from(backend) {
+        eachFile {
+            if (!name.contains("-") && !name.contains("checksum")) {
+                // Exclude the artifact from the default Cargo task
+                exclude()
+            }
+            path = "natives/$path"
+        }
+    }
 }
 
 
