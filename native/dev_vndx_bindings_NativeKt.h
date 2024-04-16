@@ -9,11 +9,19 @@ extern "C" {
 #endif
 /*
  * Class:     dev_vndx_bindings_NativeKt
- * Method:    test_jni
- * Signature: (Ljava/lang/String;)Ljava/lang/String;
+ * Method:    loadFonts
+ * Signature: (Ljava/nio/ByteBuffer;I)[Ldev/vndx/bindings/Font;
  */
-JNIEXPORT jstring JNICALL Java_dev_vndx_bindings_NativeKt_test_1jni
-  (JNIEnv *, jclass, jstring);
+JNIEXPORT jobjectArray JNICALL Java_dev_vndx_bindings_NativeKt_loadFonts
+  (JNIEnv *, jclass, jobject, jint);
+
+/*
+ * Class:     dev_vndx_bindings_NativeKt
+ * Method:    destroyFont
+ * Signature: (J)V
+ */
+JNIEXPORT void JNICALL Java_dev_vndx_bindings_NativeKt_destroyFont
+  (JNIEnv *, jclass, jlong);
 
 #ifdef __cplusplus
 }

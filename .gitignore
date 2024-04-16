@@ -3,4 +3,5 @@
 run/
 build/
 .gradle/
-
+.ccls-cache/
+src/main/resources/assets/fonts/font.ttc

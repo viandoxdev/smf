@@ -13,9 +13,7 @@ import java.util.Base64
 import java.util.Objects
 import java.util.Scanner
 
-
 class UnsupportedPlatformException(s: String) : RuntimeException(s)
-
 
 data class Metadata(val size: Long, val sha256Base64: String)
 
@@ -118,7 +116,5 @@ fun loadNativeLibrary(logger: Logger) {
         }
     } catch (e: Exception) {
         logger.error("Failed to load library", e)
-        //loadingException = e;
     }
-
 }

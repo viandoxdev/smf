@@ -10,3 +10,14 @@ crate_type = ["cdylib"]
 
 [dependencies]
 jni = "0.21"
+unicode-bidi = "0.3"
+unicode-linebreak = "0.1"
+fdsm = { version = "0.3", features = ["ttf-parser"] }
+ab_glyph_rasterizer = "0.1"
+rustybuzz = "0.13"
+ttf-parser = "0.20"
+thiserror = "1.0"
+parking_lot = "0.12"
+nalgebra = "0.32"
+# this needs to match the one used by fdsm
+image = "0.24"
