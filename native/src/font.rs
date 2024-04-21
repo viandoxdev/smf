@@ -18,6 +18,7 @@ use std::{
     collections::HashMap,
     ffi::c_char,
     iter,
+    mem::MaybeUninit,
     ops::{Deref, DerefMut},
     str::FromStr,
     sync::Arc,
@@ -38,7 +39,7 @@ use rustybuzz::{
     UnicodeBuffer,
 };
 use ttf_parser::{fonts_in_collection, Face, FaceParsingError, GlyphId, OutlineBuilder, Tag};
-use unicode_bidi::BidiInfo;
+use unicode_bidi::{BidiInfo, Level};
 use unicode_linebreak::BreakOpportunity;
 use unicode_script::{Script, ScriptExtension, UnicodeScript};
 
@@ -165,8 +166,37 @@ impl LineBreakInfo {
     }
 }
 
-struct LaidOutGlyph {
-    
+fn rect_to_bbox(rect: ttf_parser::Rect) -> BoundingBox<f32> {
+    BoundingBox::new(
+        rect.x_min as f32,
+        rect.y_min as f32,
+        rect.x_max as f32,
+        rect.y_max as f32,
+    )
+}
+
+fn level_to_dir(lvl: Level) -> Direction {
+    if lvl.is_ltr() {
+        Direction::LeftToRight
+    } else {
+        Direction::RightToLeft
+    }
+}
+
+struct Mesh {
+    texture: u32,
+    vertices: Box<[f32]>,
+    indices: Box<[u32]>,
+}
+
+#[derive(Default)]
+struct PreLayoutGlyph {
+    info: GlyphInfo,
+    pos: GlyphPosition,
+    /// Whether this glyph is the last of its line
+    end_of_line: bool,
+    direction: Direction,
+    base_direction: Direction,
 }
 
 struct ShapedRun<'a> {
@@ -177,6 +207,8 @@ struct ShapedRun<'a> {
     /// Whether this run is the last of its line (mandatory break only)
     end_of_line: bool,
     config: ShapePlanConfig,
+    direction: Direction,
+    base_direction: Direction,
 }
 
 impl<'a> ShapedRun<'a> {
@@ -187,6 +219,8 @@ impl<'a> ShapedRun<'a> {
         end: usize,
         config: ShapePlanConfig,
         end_of_line: bool,
+        direction: Direction,
+        base_direction: Direction,
     ) -> Self {
         let str = &str[start..end];
         let buffer = font.shape(str, &config);
@@ -197,6 +231,8 @@ impl<'a> ShapedRun<'a> {
             end,
             end_of_line,
             config,
+            base_direction,
+            direction,
         }
     }
 }
@@ -275,8 +311,10 @@ impl<'f> Font<'f> {
     }
 
     fn process(&mut self, str: &str, language: Arc<Language>, max_length: Option<f32>) {
-        let (runs, bidi, linebreaks) = self.split_runs(str, language);
+        let (mut runs, linebreaks) = self.split_runs(str, language);
         let max_length = max_length.unwrap_or(f32::MAX);
+        let mut lines = self.layout_lines(str, &mut runs, linebreaks, max_length);
+        let meshes = self.layout(&mut lines);
     }
 
     // TODO: Figure language out through configurable language list and script value rather than
@@ -284,11 +322,11 @@ impl<'f> Font<'f> {
 
     /// Split text into runs (belonging to the same paragraph and script), and shape them.
     /// This is done before layout so depending on what happens after some text might be reshaped.
-    fn split_runs<'a>(
-        &'a mut self,
+    fn split_runs<'a: 's, 's>(
+        &'s mut self,
         str: &'a str,
         language: Arc<Language>,
-    ) -> (Vec<ShapedRun<'a>>, BidiInfo, LineBreakInfo) {
+    ) -> (Vec<ShapedRun<'a>>, LineBreakInfo) {
         let bidi = BidiInfo::new(str, None);
         let linebreak = LineBreakInfo::new(str);
 
@@ -296,15 +334,12 @@ impl<'f> Font<'f> {
 
         // Split text into runs of similar Scripts (and paragraphs) and shape them.
         for par in &bidi.paragraphs {
-            let direction = if par.level.is_ltr() {
-                Direction::LeftToRight
-            } else {
-                Direction::RightToLeft
-            };
+            let par_direction = level_to_dir(par.level);
 
             let par_start = par.range.start;
             let par = &str[par.range.clone()];
 
+            let mut dir = par_direction;
             let mut start = 0usize;
             let mut scripts = ScriptExtension::default();
             // Iterator over each character's position and its corresponding scripts, with an extra
@@ -324,9 +359,12 @@ impl<'f> Font<'f> {
                         Some(BreakOpportunity::Mandatory)
                     );
 
+                let next_dir = level_to_dir(bidi.levels[i]);
+                let direction_changed = next_dir == dir;
+
                 // Check if the current character isn't compatible with the run or if we need to
                 // break before the current character
-                if next_scripts.is_empty() || should_break {
+                if next_scripts.is_empty() || should_break || direction_changed {
                     // If so, the current run ends with the previous char (since the current one
                     // is incompatible), so process that run
                     {
@@ -339,7 +377,7 @@ impl<'f> Font<'f> {
                             .expect("Couldn't convert script to rustybuzz");
                         let language = language.clone();
                         let cfg = ShapePlanConfig {
-                            direction,
+                            direction: dir,
                             language,
                             script,
                         };
@@ -353,6 +391,8 @@ impl<'f> Font<'f> {
                             end: par_start + i,
                             end_of_line: should_break,
                             config: cfg,
+                            base_direction: par_direction,
+                            direction: dir,
                         });
                     }
                     // Start a new run
@@ -360,24 +400,22 @@ impl<'f> Font<'f> {
                 }
 
                 scripts = next_scripts;
+                dir = next_dir;
             }
         }
 
-        (runs, bidi, linebreak)
+        (runs, linebreak)
     }
 
-    fn layout<'a>(
+    /// Perform text wrap and reshape as needed
+    fn layout_lines<'a>(
         &mut self,
         str: &'a str,
         runs: &'a mut Vec<ShapedRun<'a>>,
-        bidi: BidiInfo,
         mut lb: LineBreakInfo,
         max_length: f32,
-    ) {
+    ) -> Vec<PreLayoutGlyph> {
         let mut x = 0f32;
-        let mut y = 0f32;
-
-        let line_height = self.face.height() as f32 * self.config.scale * self.config.line_height;
 
         #[derive(Debug, Clone, Copy)]
         struct GlyphCheckpoint {
@@ -387,15 +425,15 @@ impl<'f> Font<'f> {
             run_index: usize,
             /// Index of the glyph in the run's glyph_infos
             glyph_index: usize,
-            /// Index of the 
-            laid_out_index: usize,
             /// x offset before the glyph was placed
             x: f32,
+            direction: Direction,
+            base_direction: Direction,
         }
 
         let mut current_line = Vec::<GlyphCheckpoint>::new();
 
-        let mut laid_out_glyphs = Vec::<LaidOutGlyph>::new();
+        let mut lines = Vec::new();
 
         // We can't use a for loop since we'll be "going back in time" if necessary
         let mut run_index = 0usize;
@@ -409,9 +447,6 @@ impl<'f> Font<'f> {
 
                 let adv = pos.x_advance as f32 * self.config.scale;
 
-                // TODO: error handling
-                let (bbox, layer) = self.get_glyph_location(glyph.glyph_id).unwrap();
-                
                 // TODO: Bidi reordering and actual layout
                 // So we reorder the glyphs right ? accross runs ?
 
@@ -419,8 +454,9 @@ impl<'f> Font<'f> {
                     index: glyph.cluster as usize + run.start,
                     run_index,
                     glyph_index,
-                    laid_out_index: laid_out_glyphs.len(),
                     x,
+                    direction: run.direction,
+                    base_direction: run.base_direction,
                 });
 
                 if x + adv > max_length {
@@ -473,14 +509,26 @@ impl<'f> Font<'f> {
                         // cluster, it isn't safe, we only have to handle the case where
                         // break_index aligns with a cluster here
 
-                        let &break_glyph = current_line
+                        let (break_glyph_index, &break_glyph) = current_line
                             .iter()
-                            .rfind(|GlyphCheckpoint { index, .. }| *index == break_index)
+                            .enumerate()
+                            .rfind(|(_, GlyphCheckpoint { index, .. })| *index == break_index)
                             .expect("Can't find break cluster in line");
+
+                        lines.extend(current_line[0..break_glyph_index].iter().map(|g| {
+                            let buf = &runs[g.run_index].buffer;
+                            PreLayoutGlyph {
+                                pos: buf.glyph_positions()[g.glyph_index],
+                                info: buf.glyph_infos()[g.glyph_index],
+                                end_of_line: false,
+                                direction: g.direction,
+                                base_direction: g.base_direction,
+                            }
+                        }));
+                        lines.last_mut().unwrap().end_of_line = true;
 
                         // Time travel (kinda disgusting tbh)
                         x = 0.0;
-                        y += line_height;
                         current_line.clear();
                         run_index = break_glyph.run_index;
                         glyph_index = break_glyph.glyph_index;
@@ -505,6 +553,8 @@ impl<'f> Font<'f> {
                             break_index,
                             broken_run.config.clone(),
                             true,
+                            broken_run.direction,
+                            broken_run.base_direction,
                         );
                         let run2 = ShapedRun::new(
                             self,
@@ -513,13 +563,18 @@ impl<'f> Font<'f> {
                             broken_run.end,
                             broken_run.config.clone(),
                             false,
+                            broken_run.direction,
+                            broken_run.base_direction,
                         );
 
                         // Replace broken run with both runs
                         runs[break_run_index] = run2;
                         runs.insert(break_run_index, run1);
 
-                        let line_start_of_run = current_line.iter().position(|g| g.run_index == break_run_index).expect("Break run can't be found in current_line");
+                        let line_start_of_run = current_line
+                            .iter()
+                            .position(|g| g.run_index == break_run_index)
+                            .expect("Break run can't be found in current_line");
 
                         run_index = break_run_index;
                         glyph_index = 0;
@@ -541,13 +596,153 @@ impl<'f> Font<'f> {
             glyph_index = 0;
 
             if run.end_of_line {
-                current_line.clear();
-                y += line_height;
+                lines.extend(current_line.drain(..).map(|g| {
+                    let buf = &runs[g.run_index].buffer;
+                    PreLayoutGlyph {
+                        pos: buf.glyph_positions()[g.glyph_index],
+                        info: buf.glyph_infos()[g.glyph_index],
+                        end_of_line: false,
+                        direction: g.direction,
+                        base_direction: g.base_direction,
+                    }
+                }));
+                lines.last_mut().unwrap().end_of_line = true;
                 x = 0.0;
             }
 
             run_index += 1;
         }
+
+        lines
+    }
+
+    fn layout(&mut self, lines: &mut Vec<PreLayoutGlyph>) -> Result<Vec<Mesh>, SMFError> {
+        let line_height = self.face.height() as f32 * self.config.scale * self.config.line_height;
+
+        #[derive(Clone)]
+        struct BuildingMesh {
+            vertices: Vec<f32>,
+            indices: Vec<u32>,
+            texture: u32,
+            empty: bool,
+        }
+
+        impl From<BuildingMesh> for Mesh {
+            fn from(value: BuildingMesh) -> Self {
+                Mesh {
+                    texture: value.texture,
+                    vertices: value.vertices.into_boxed_slice(),
+                    indices: value.indices.into_boxed_slice(),
+                }
+            }
+        }
+
+        impl BuildingMesh {
+            #[inline(always)]
+            fn add_quad(&mut self, vertices: [f32; 16]) {
+                let i = self.vertices.len() as u32;
+                self.vertices.extend_from_slice(&vertices);
+                self.indices
+                    .extend_from_slice(&[i, i + 1, i + 2, i, i + 2, i + 3]);
+                self.empty = false;
+            }
+        }
+
+        let mut meshes = (0..self.textures.len())
+            .map(|i| BuildingMesh {
+                texture: i as u32,
+                indices: Vec::new(),
+                vertices: Vec::new(),
+                empty: true,
+            })
+            .collect_vec();
+
+        let mut y = 0f32;
+        let mut line_start_index = 0;
+        let mut base_direction = lines
+            .first()
+            .map(|g| g.base_direction)
+            .unwrap_or(Direction::LeftToRight);
+
+        for i in 0..=lines.len() {
+            // We first need to indentify the line
+            if i < lines.len() && !lines[i].end_of_line {
+                continue;
+            }
+
+            // The last line ended (and we may need to start a new one)
+            if let Direction::RightToLeft = base_direction {
+                lines[line_start_index..i].reverse();
+            }
+
+            // Reverse runs of text with directions different than the base one
+            // For that we first need to figure out the runs
+            {
+                let mut dir = base_direction;
+                let mut run_start = line_start_index;
+                for j in line_start_index..=i {
+                    if j < i && lines[j].direction == dir {
+                        // Glyph at index j is part of the current run
+                        continue;
+                    }
+
+                    if dir != base_direction {
+                        // Run ended and is of a different direction than base: reverse
+                        lines[run_start..j].reverse();
+                    }
+
+                    if j < i {
+                        // Start a new run
+                        dir = lines[j].direction;
+                        run_start = j;
+                    }
+                }
+            }
+
+            // Bidi reordering has been done, we just need to layout the line now
+
+            let mut x = 0f32;
+
+            for g in &lines[line_start_index..i] {
+                let (tc, tex) = self.get_glyph_location(g.info.glyph_id)?;
+                let bbox = self
+                    .face
+                    .glyph_bounding_box(GlyphId(g.info.glyph_id as u16))
+                    .map(rect_to_bbox)
+                    .unwrap_or(BoundingBox::ZERO);
+
+                let (gx, gy) = (x, y);
+
+                x += g.pos.x_advance as f32 * self.config.scale;
+
+                if bbox.width() == 0.0 || bbox.height() == 0.0 {
+                    // No point in laying out a glyph that won't get rendered
+                    continue;
+                }
+
+                let (w, h) = (bbox.width() * self.config.scale, bbox.height() * self.config.scale);
+
+                meshes[tex as usize].add_quad([
+                    gx + w, gy + h, tc.x2, tc.y1,
+                    gx, gy + h, tc.x1, tc.y1,
+                    gx, gy, tc.x1, tc.y2,
+                    gx + w, gy, tc.x2, tc.y2,
+                ]);
+            }
+
+            if i < lines.len() {
+                // We have to start a new line
+                line_start_index = i;
+                y += line_height;
+                base_direction = lines[i].base_direction;
+            }
+        }
+
+        Ok(meshes
+            .into_iter()
+            .filter(|b| !b.empty)
+            .map(Mesh::from)
+            .collect_vec())
     }
 
     /// Shape a run of text
@@ -673,7 +868,7 @@ impl<'f> Font<'f> {
     /// Rasterize a glyph and add it to the atlas, returning its location
     fn rasterize_glyph(&mut self, raw_glyph_id: u32) -> Result<(BoundingBox<f32>, u32), SMFError> {
         let glyph_id = GlyphId(raw_glyph_id as u16);
-        let Some(bbox) = self.face.glyph_bounding_box(glyph_id) else {
+        let Some(rect) = self.face.glyph_bounding_box(glyph_id) else {
             return if let Some(_) = self.face.glyph_svg_image(glyph_id) {
                 // TODO: Handle SVG glyphs
                 Err(SMFError::UnsupportedGlyphFormat)
@@ -692,12 +887,7 @@ impl<'f> Font<'f> {
         let padding = self.gconf.glyph_padding;
 
         // Glyph bounding box, in shape space (what we'll call the outline's raw coordinate space)
-        let bbox = BoundingBox::new(
-            bbox.x_min as f32,
-            bbox.y_min as f32,
-            bbox.x_max as f32,
-            bbox.y_max as f32,
-        );
+        let bbox = rect_to_bbox(rect);
 
         // Height and width  of the glyph in pixels on the raster
         let width = (bbox.width() * self.config.scale).ceil() as u32;

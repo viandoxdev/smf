@@ -25,92 +25,6 @@ use image::{GenericImage, ImageBuffer, Pixel, Rgb, Luma};
 
 use crate::{config::GlobalConfig, font::{RasterKind, Font}, packing::BoundingBox};
 
-//#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-//pub enum TextureFormat {
-//    Rgba32,
-//    R8,
-//}
-//
-//#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-//pub enum PixelValue {
-//    Rgba32(u8, u8, u8, u8),
-//    R8(u8),
-//}
-//
-//impl TextureFormat {
-//    /// Size of a pixel in bytes
-//    pub fn pixel_size(&self) -> u32 {
-//        match self {
-//            Self::R8 => 1,
-//            Self::Rgba32 => 4,
-//        }
-//    }
-//}
-//
-//impl From<RasterKind> for TextureFormat {
-//    fn from(value: RasterKind) -> Self {
-//        match value {
-//            RasterKind::Bitmap => Self::R8,
-//            RasterKind::SDF => Self::R8,
-//            RasterKind::MSDF => Self::Rgba32,
-//        }
-//    }
-//}
-
-//pub struct Texture {
-//    pub size: u32,
-//    pub format: TextureFormat,
-//    buffer: ImageBuffer<>
-//}
-
-//impl Texture {
-//    /// Just size as usize
-//    pub fn capacity(&self) -> usize {
-//        self.size as usize
-//    }
-//
-//    /// Pointer to the start of texture's data
-//    pub unsafe fn ptr(&self) -> *const u8 {
-//        self.bytes.as_ptr()
-//    }
-//
-//    pub fn set_pixel(&mut self, x: u32, y: u32, value: PixelValue) -> Option<()> {
-//        if x >= self.size || y >= self.size {
-//            return None;
-//        }
-//
-//        let off = (x + y * self.size * self.format.pixel_size()) as usize;
-//
-//        match self.format {
-//            TextureFormat::R8 => {
-//                let PixelValue::R8(v) = value else {
-//                    return None;
-//                };
-//
-//                self.bytes[off] = v;
-//
-//                Some(())
-//            }
-//            TextureFormat::Rgba32 => {
-//                let PixelValue::Rgba32(r, g, b, a) = value else {
-//                    return None;
-//                };
-//
-//                self.bytes[off] = r;
-//                self.bytes[off + 1] = g;
-//                self.bytes[off + 2] = b;
-//                self.bytes[off + 3] = a;
-//
-//                Some(())
-//            }
-//        }
-//    }
-//
-//    pub fn get_mut_view(&mut self, bbox: BoundingBox<u32>) -> TextureView {
-//
-//    }
-//}
-
 /// The textures data associated with a font struct
 pub struct TextureStore<P: Pixel> {
     size: u32,
@@ -155,6 +69,10 @@ impl GenericTextureStore for TextureStore<Rgb<u8>> {
     fn write_tex(&mut self, index: u32, path: &Path) {
         let _ = self.get_texture(index).save_with_format(path, image::ImageFormat::Png);
     }
+
+    fn len(&self) -> usize {
+        self.textures.len()
+    }
 }
 
 impl GenericTextureStore for TextureStore<Luma<u8>> {
@@ -169,6 +87,10 @@ impl GenericTextureStore for TextureStore<Luma<u8>> {
     fn write_tex(&mut self, index: u32, path: &Path) {
         let _ = self.get_texture(index).save_with_format(path, image::ImageFormat::Png);
     }
+
+    fn len(&self) -> usize {
+        self.textures.len()
+    }
 }
 
 
@@ -176,4 +98,5 @@ pub trait GenericTextureStore: 'static {
     fn get_texture_rgb(&mut self, index: u32) -> Option<&mut ImageBuffer<Rgb<u8>, Vec<u8>>>;
     fn get_texture_luma(&mut self, index: u32) -> Option<&mut ImageBuffer<Luma<u8>, Vec<u8>>>;
     fn write_tex(&mut self, index: u32, path: &Path);
+    fn len(&self) -> usize;
 }
