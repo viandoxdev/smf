@@ -16,7 +16,11 @@
 
 use std::{
     collections::HashMap,
+    ffi::c_char,
+    iter,
     ops::{Deref, DerefMut},
+    str::FromStr,
+    sync::Arc,
 };
 
 use ab_glyph_rasterizer::{Point, Rasterizer};
@@ -27,9 +31,16 @@ use fdsm::{
     transform::Transform,
 };
 use image::{GenericImage, GenericImageView, ImageBuffer, Luma, Pixel, Primitive, Rgb, SubImage};
+use itertools::Itertools;
 use nalgebra::{Affine2, Scale2, Similarity2, TAffine, Transform2, Translation2, Vector2};
-use rustybuzz::{Direction, Face as BuzzFace, Language, Script, ShapePlan, UnicodeBuffer};
-use ttf_parser::{fonts_in_collection, Face, FaceParsingError, GlyphId, OutlineBuilder};
+use rustybuzz::{
+    Direction, Face as BuzzFace, GlyphBuffer, GlyphInfo, GlyphPosition, Language, ShapePlan,
+    UnicodeBuffer,
+};
+use ttf_parser::{fonts_in_collection, Face, FaceParsingError, GlyphId, OutlineBuilder, Tag};
+use unicode_bidi::BidiInfo;
+use unicode_linebreak::BreakOpportunity;
+use unicode_script::{Script, ScriptExtension, UnicodeScript};
 
 use crate::{
     config::{FontConfig, GlobalConfig},
@@ -64,8 +75,8 @@ impl TryFrom<i32> for RasterKind {
 #[derive(Hash, Debug, PartialEq, Eq, Clone)]
 struct ShapePlanConfig {
     direction: Direction,
-    language: Language,
-    script: Script,
+    language: Arc<Language>,
+    script: rustybuzz::Script,
 }
 
 /// Intermediary struct used in glyph rasterization
@@ -107,10 +118,86 @@ impl GlyphRasterInfo {
         // Flip vertically
         let flip = Translation2::new(0.0, self.padded_height() as f64)
             * nalgebra::convert::<_, nalgebra::Transform<f64, TAffine, 2>>(Scale2::new(1.0, -1.0));
-            
+
         // Transformations are applied in reverse order from multiplication
         // (origin_to_top_left_corner will be applied first, then scale, ...)
         nalgebra::convert(flip * add_padding * scale * origin_to_top_left_corner)
+    }
+}
+
+struct LineBreakInfo {
+    inner: Vec<(usize, BreakOpportunity)>,
+}
+
+impl LineBreakInfo {
+    fn new(str: &str) -> Self {
+        let inner = unicode_linebreak::linebreaks(str).collect::<Vec<_>>();
+        Self { inner }
+    }
+
+    #[inline(always)]
+    fn get_index(&self, index: usize) -> Result<usize, usize> {
+        self.inner.binary_search_by_key(&index, |(i, _)| *i)
+    }
+
+    fn opportunity(&self, index: usize) -> Option<BreakOpportunity> {
+        Some(self.inner[self.get_index(index).ok()?].1)
+    }
+
+    /// Get the closest opportunity before an index
+    fn last_opportunity(&self, index: usize) -> Option<(usize, BreakOpportunity)> {
+        // Either there is an opportunity at this exact index (then it returns that index, and we
+        // need to subtract one to get the one before), or there isn't (then it returns the next
+        // one, so we also need to subtract one to get the one before).
+        let index = self.get_index(index).unwrap_or_else(|x| x);
+        Some(self.inner[index.checked_sub(1)?])
+    }
+
+    fn set_opportunity(&mut self, index: usize, op: BreakOpportunity) {
+        match self.get_index(index) {
+            Ok(idx) => {
+                self.inner[idx] = (index, op);
+            }
+            Err(idx) => {
+                self.inner.insert(idx, (index, op));
+            }
+        }
+    }
+}
+
+struct LaidOutGlyph {
+    
+}
+
+struct ShapedRun<'a> {
+    buffer: GlyphBuffer,
+    str: &'a str,
+    start: usize,
+    end: usize,
+    /// Whether this run is the last of its line (mandatory break only)
+    end_of_line: bool,
+    config: ShapePlanConfig,
+}
+
+impl<'a> ShapedRun<'a> {
+    fn new(
+        font: &mut Font,
+        str: &'a str,
+        start: usize,
+        end: usize,
+        config: ShapePlanConfig,
+        end_of_line: bool,
+    ) -> Self {
+        let str = &str[start..end];
+        let buffer = font.shape(str, &config);
+        Self {
+            buffer,
+            str,
+            start,
+            end,
+            end_of_line,
+            config,
+        }
     }
 }
 
@@ -187,7 +274,284 @@ impl<'f> Font<'f> {
         })
     }
 
-    fn shape(&mut self, str: &str, cfg: &ShapePlanConfig) {
+    fn process(&mut self, str: &str, language: Arc<Language>, max_length: Option<f32>) {
+        let (runs, bidi, linebreaks) = self.split_runs(str, language);
+        let max_length = max_length.unwrap_or(f32::MAX);
+    }
+
+    // TODO: Figure language out through configurable language list and script value rather than
+    // just requesting it (see: https://github.com/harfbuzz/harfbuzz/issues/1288)
+
+    /// Split text into runs (belonging to the same paragraph and script), and shape them.
+    /// This is done before layout so depending on what happens after some text might be reshaped.
+    fn split_runs<'a>(
+        &'a mut self,
+        str: &'a str,
+        language: Arc<Language>,
+    ) -> (Vec<ShapedRun<'a>>, BidiInfo, LineBreakInfo) {
+        let bidi = BidiInfo::new(str, None);
+        let linebreak = LineBreakInfo::new(str);
+
+        let mut runs = Vec::new();
+
+        // Split text into runs of similar Scripts (and paragraphs) and shape them.
+        for par in &bidi.paragraphs {
+            let direction = if par.level.is_ltr() {
+                Direction::LeftToRight
+            } else {
+                Direction::RightToLeft
+            };
+
+            let par_start = par.range.start;
+            let par = &str[par.range.clone()];
+
+            let mut start = 0usize;
+            let mut scripts = ScriptExtension::default();
+            // Iterator over each character's position and its corresponding scripts, with an extra
+            // Unknown (empty set) script added to end the last run.
+            let scripts_iter = par
+                .char_indices()
+                .map(|(i, c)| (i, c.script_extension()))
+                .chain(std::iter::once((par.len(), Script::Unknown.into())));
+            for (i, char_scripts) in scripts_iter {
+                let next_scripts = scripts.intersection(char_scripts);
+                // Whether a line break should occur before the current character
+                // We want to make sure runs are split by linebreaks as well to avoid shaping
+                // accros lines (we would need to reshape in layout otherwise, which is slower)
+                let should_break = i > 0
+                    && matches!(
+                        linebreak.opportunity(i - 1),
+                        Some(BreakOpportunity::Mandatory)
+                    );
+
+                // Check if the current character isn't compatible with the run or if we need to
+                // break before the current character
+                if next_scripts.is_empty() || should_break {
+                    // If so, the current run ends with the previous char (since the current one
+                    // is incompatible), so process that run
+                    {
+                        let str = &par[start..i];
+                        let script = scripts
+                            .iter()
+                            .next()
+                            .expect("ScriptExtension isn't empty, yet iterator yields no script");
+                        let script = rustybuzz::Script::from_str(script.short_name())
+                            .expect("Couldn't convert script to rustybuzz");
+                        let language = language.clone();
+                        let cfg = ShapePlanConfig {
+                            direction,
+                            language,
+                            script,
+                        };
+
+                        let buffer = self.shape(str, &cfg);
+
+                        runs.push(ShapedRun {
+                            buffer,
+                            str,
+                            start: par_start + start,
+                            end: par_start + i,
+                            end_of_line: should_break,
+                            config: cfg,
+                        });
+                    }
+                    // Start a new run
+                    start = i;
+                }
+
+                scripts = next_scripts;
+            }
+        }
+
+        (runs, bidi, linebreak)
+    }
+
+    fn layout<'a>(
+        &mut self,
+        str: &'a str,
+        runs: &'a mut Vec<ShapedRun<'a>>,
+        bidi: BidiInfo,
+        mut lb: LineBreakInfo,
+        max_length: f32,
+    ) {
+        let mut x = 0f32;
+        let mut y = 0f32;
+
+        let line_height = self.face.height() as f32 * self.config.scale * self.config.line_height;
+
+        #[derive(Debug, Clone, Copy)]
+        struct GlyphCheckpoint {
+            /// Index of the start of the glyph's cluster in the string
+            index: usize,
+            /// Index of the run in runs
+            run_index: usize,
+            /// Index of the glyph in the run's glyph_infos
+            glyph_index: usize,
+            /// Index of the 
+            laid_out_index: usize,
+            /// x offset before the glyph was placed
+            x: f32,
+        }
+
+        let mut current_line = Vec::<GlyphCheckpoint>::new();
+
+        let mut laid_out_glyphs = Vec::<LaidOutGlyph>::new();
+
+        // We can't use a for loop since we'll be "going back in time" if necessary
+        let mut run_index = 0usize;
+        let mut glyph_index = 0usize;
+        'run_loop: while run_index < runs.len() {
+            let run = &runs[run_index];
+
+            while glyph_index < run.buffer.glyph_infos().len() {
+                let pos = run.buffer.glyph_positions()[glyph_index];
+                let glyph = run.buffer.glyph_infos()[glyph_index];
+
+                let adv = pos.x_advance as f32 * self.config.scale;
+
+                // TODO: error handling
+                let (bbox, layer) = self.get_glyph_location(glyph.glyph_id).unwrap();
+                
+                // TODO: Bidi reordering and actual layout
+                // So we reorder the glyphs right ? accross runs ?
+
+                current_line.push(GlyphCheckpoint {
+                    index: glyph.cluster as usize + run.start,
+                    run_index,
+                    glyph_index,
+                    laid_out_index: laid_out_glyphs.len(),
+                    x,
+                });
+
+                if x + adv > max_length {
+                    // We exceeded the line's max length, we need to break (and potentially
+                    // reshape some runs)
+
+                    // Figure out where we need to break
+                    // We should break *before* break_index
+                    let (break_index, safe) =
+                        match lb.last_opportunity(glyph.cluster as usize + run.start) {
+                            Some((index, BreakOpportunity::Allowed)) => {
+                                // We can, and should, break here
+
+                                // BreakOpportunity::Allowed means we may break *after* index, but this
+                                // code should return the index of the character we may break before
+                                // of.
+                                let index = index + 1;
+                                // Check if it is safe to break here: try to look for the glyph whose
+                                // cluster starts at index, and check if the corresponding glyph can be
+                                // broken, if not found, just assume it isn't safe
+                                let safe = runs[current_line[0].run_index..]
+                                    .iter()
+                                    .flat_map(|r| {
+                                        r.buffer
+                                            .glyph_infos()
+                                            .iter()
+                                            .zip(std::iter::repeat(r.start))
+                                    })
+                                    .any(|(g, start)| {
+                                        g.cluster as usize + start == index && !g.unsafe_to_break()
+                                    });
+                                (index, safe)
+                            }
+                            _ => {
+                                // Either the last opportunity was a mandatory one (which mean it
+                                // wasn't in this line), or there was no opportunity before. This means
+                                // we need to force break somewhere.
+
+                                // Just break before this cluster
+                                (glyph.cluster as usize + run.start, !glyph.unsafe_to_break())
+                            }
+                        };
+
+                    // Record a mandatory line break to make sure further iterations are aware of
+                    // it
+                    lb.set_opportunity(break_index, BreakOpportunity::Mandatory);
+
+                    if safe {
+                        // Because we conservatively assume that if a break has to happen mid
+                        // cluster, it isn't safe, we only have to handle the case where
+                        // break_index aligns with a cluster here
+
+                        let &break_glyph = current_line
+                            .iter()
+                            .rfind(|GlyphCheckpoint { index, .. }| *index == break_index)
+                            .expect("Can't find break cluster in line");
+
+                        // Time travel (kinda disgusting tbh)
+                        x = 0.0;
+                        y += line_height;
+                        current_line.clear();
+                        run_index = break_glyph.run_index;
+                        glyph_index = break_glyph.glyph_index;
+                        continue 'run_loop;
+                    } else {
+                        // We can't safely break, so we need to get the broken run, split it, and
+                        // reshape each part
+                        // Here break index may not exactly align with any cluster
+
+                        // Look for the run where the break happens
+                        // Start looking from the first run of the line
+                        let (break_run_index, broken_run) = runs[current_line[0].run_index..]
+                            .iter()
+                            .find_position(|r| break_index >= r.start && break_index < r.end)
+                            .expect("Can't find break run");
+
+                        // Reshape runs
+                        let run1 = ShapedRun::new(
+                            self,
+                            str,
+                            broken_run.start,
+                            break_index,
+                            broken_run.config.clone(),
+                            true,
+                        );
+                        let run2 = ShapedRun::new(
+                            self,
+                            str,
+                            break_index,
+                            broken_run.end,
+                            broken_run.config.clone(),
+                            false,
+                        );
+
+                        // Replace broken run with both runs
+                        runs[break_run_index] = run2;
+                        runs.insert(break_run_index, run1);
+
+                        let line_start_of_run = current_line.iter().position(|g| g.run_index == break_run_index).expect("Break run can't be found in current_line");
+
+                        run_index = break_run_index;
+                        glyph_index = 0;
+                        x = current_line[line_start_of_run].x;
+
+                        // Remove all of the elements of the broken run and after since their
+                        // layout is bad
+                        current_line.drain(line_start_of_run..);
+
+                        continue 'run_loop;
+                    }
+                } else {
+                    x += adv;
+                }
+
+                glyph_index += 1;
+            }
+
+            glyph_index = 0;
+
+            if run.end_of_line {
+                current_line.clear();
+                y += line_height;
+                x = 0.0;
+            }
+
+            run_index += 1;
+        }
+    }
+
+    /// Shape a run of text
+    fn shape(&mut self, str: &str, cfg: &ShapePlanConfig) -> GlyphBuffer {
         let plan = match self.shape_plan_chache.get(cfg) {
             Some(p) => p,
             None => {
@@ -204,10 +568,8 @@ impl<'f> Font<'f> {
 
         let mut buffer = UnicodeBuffer::new();
         buffer.push_str(str);
-        buffer.set_direction(cfg.direction);
-        buffer.set_script(cfg.script);
 
-        let buffer = rustybuzz::shape_with_plan(&self.face, plan, buffer);
+        rustybuzz::shape_with_plan(&self.face, plan, buffer)
     }
 
     // TODO: remove pub
@@ -449,7 +811,7 @@ impl OutlineBuilder for Builder {
 }
 
 #[cfg(test)]
-mod Test {
+mod test {
     use std::path::Path;
 
     use crate::config::GlobalConfig;

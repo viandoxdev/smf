@@ -26,7 +26,7 @@ class SMF {
 
             logger.info("Got direct byte buffer to font data: ${buffer.capacity()}")
 
-            val config = FontConfig(rasterKind = RasterKind.Bitmap, scale = 1.0f)
+            val config = FontConfig(rasterKind = RasterKind.Bitmap, scale = 1.0f, lineHeight = 1.5f)
 
             val fonts = Font.load(buffer, config)
 

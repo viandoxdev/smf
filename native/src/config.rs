@@ -88,6 +88,7 @@ impl GlobalConfig {
 pub struct FontConfig {
     pub raster_kind: RasterKind,
     pub scale: f32,
+    pub line_height: f32,
 }
 
 impl FontConfig {
@@ -95,6 +96,7 @@ impl FontConfig {
         Ok(Self {
             raster_kind: RasterKind::try_from(env.get_field(&obj, "rasterKind", "I")?.i()?)?,
             scale: env.get_field(&obj, "scale", "F")?.f()?,
+            line_height: env.get_field(&obj, "lineHeight", "F")?.f()?,
         })
     }
 
@@ -102,10 +104,11 @@ impl FontConfig {
         let class = env.find_class("dev/vndx/bindings/FontConfig")?;
         let obj = env.new_object(
             &class,
-            "(IF)V",
+            "(IFF)V",
             &[
                 JValueGen::Int(self.raster_kind as i32),
                 JValueGen::Float(self.scale),
+                JValueGen::Float(self.line_height),
             ],
         )?;
         Ok(obj.as_raw())

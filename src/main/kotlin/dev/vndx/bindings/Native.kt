@@ -36,7 +36,7 @@ class GlobalConfig(val atlasSize: Int, val glyphPadding: Int, val sinAlpha: Doub
     }
 }
 
-class FontConfig(val rasterKind: Int, val scale: Float)
+class FontConfig(val rasterKind: Int, val scale: Float, lineHeight: Float)
 
 private external fun loadFonts(data: ByteBuffer, config: FontConfig): Array<Font>
 private external fun destroyFont(addr: Long)
