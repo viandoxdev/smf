@@ -47,7 +47,7 @@ use crate::{
     config::{FontConfig, GlobalConfig},
     error::SMFError,
     packing::{BoundingBox, Heuristics, Layered, LayeredOnlinePacker, MaxRectPacker},
-    textures::{GenericTextureStore, TextureStore},
+    textures::{Diff, GenericTextureStore, TextureStore},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -126,6 +126,7 @@ impl GlyphRasterInfo {
     }
 }
 
+#[derive(Default)]
 struct LineBreakInfo {
     inner: Vec<(usize, BreakOpportunity)>,
 }
@@ -183,10 +184,25 @@ fn level_to_dir(lvl: Level) -> Direction {
     }
 }
 
-struct Mesh {
-    texture: u32,
-    vertices: Box<[f32]>,
-    indices: Box<[u32]>,
+pub struct Command {
+    pub str: String,
+    pub multiline: bool,
+    pub max_length: Option<f32>,
+}
+
+pub struct BatchedCommands {
+    pub commands: Vec<Command>,
+}
+
+pub struct BatchedResults {
+    pub meshes: Vec<Result<Vec<Mesh>, SMFError>>,
+    pub diffs: Vec<Diff>,
+}
+
+pub struct Mesh {
+    pub texture: u32,
+    pub vertices: Box<[f32]>,
+    pub indices: Box<[u32]>,
 }
 
 #[derive(Default)]
@@ -310,11 +326,40 @@ impl<'f> Font<'f> {
         })
     }
 
-    fn process(&mut self, str: &str, language: Arc<Language>, max_length: Option<f32>) {
-        let (mut runs, linebreaks) = self.split_runs(str, language);
+    pub fn process_batched(&mut self, commands: BatchedCommands) -> BatchedResults {
+        let meshes = commands
+            .commands
+            .into_iter()
+            .map(|c| self.process(c))
+            .collect_vec();
+        let diffs = self.textures.take_concatenated_diffs();
+
+        BatchedResults { meshes, diffs }
+    }
+
+    pub fn process(&mut self, command: Command) -> Result<Vec<Mesh>, SMFError> {
+        if command.multiline {
+            self.process_multiline(&command.str, command.max_length)
+        } else {
+            self.process_uniline(&command.str)
+        }
+    }
+
+    pub fn process_uniline(&mut self, str: &str) -> Result<Vec<Mesh>, SMFError> {
+        let (runs, _) = self.split_runs(str, false);
+        let mut lines = self.pre_layout(&runs);
+        self.layout(&mut lines)
+    }
+
+    pub fn process_multiline(
+        &mut self,
+        str: &str,
+        max_length: Option<f32>,
+    ) -> Result<Vec<Mesh>, SMFError> {
+        let (mut runs, linebreaks) = self.split_runs(str, true);
         let max_length = max_length.unwrap_or(f32::MAX);
-        let mut lines = self.layout_lines(str, &mut runs, linebreaks, max_length);
-        let meshes = self.layout(&mut lines);
+        let mut lines = self.pre_layout_multline(str, &mut runs, linebreaks, max_length);
+        self.layout(&mut lines)
     }
 
     // TODO: Figure language out through configurable language list and script value rather than
@@ -325,10 +370,14 @@ impl<'f> Font<'f> {
     fn split_runs<'a: 's, 's>(
         &'s mut self,
         str: &'a str,
-        language: Arc<Language>,
+        multiline: bool,
     ) -> (Vec<ShapedRun<'a>>, LineBreakInfo) {
         let bidi = BidiInfo::new(str, None);
-        let linebreak = LineBreakInfo::new(str);
+        let linebreak = if multiline {
+            LineBreakInfo::new(str)
+        } else {
+            LineBreakInfo::default()
+        };
 
         let mut runs = Vec::new();
 
@@ -353,13 +402,18 @@ impl<'f> Font<'f> {
                 // Whether a line break should occur before the current character
                 // We want to make sure runs are split by linebreaks as well to avoid shaping
                 // accros lines (we would need to reshape in layout otherwise, which is slower)
-                let should_break = i > 0
+                let should_break = multiline
+                    && i > 0
                     && matches!(
                         linebreak.opportunity(i - 1),
                         Some(BreakOpportunity::Mandatory)
                     );
 
-                let next_dir = level_to_dir(bidi.levels[i]);
+                let next_dir = if i < par.len() {
+                    level_to_dir(bidi.levels[i])
+                } else {
+                    dir
+                };
                 let direction_changed = next_dir == dir;
 
                 // Check if the current character isn't compatible with the run or if we need to
@@ -375,7 +429,7 @@ impl<'f> Font<'f> {
                             .expect("ScriptExtension isn't empty, yet iterator yields no script");
                         let script = rustybuzz::Script::from_str(script.short_name())
                             .expect("Couldn't convert script to rustybuzz");
-                        let language = language.clone();
+                        let language = self.config.language.clone();
                         let cfg = ShapePlanConfig {
                             direction: dir,
                             language,
@@ -407,8 +461,32 @@ impl<'f> Font<'f> {
         (runs, linebreak)
     }
 
+    /// Just turn runs into PreLayoutGlyph
+    fn pre_layout<'a>(&mut self, runs: &[ShapedRun<'a>]) -> Vec<PreLayoutGlyph> {
+        let mut res = Vec::new();
+
+        for run in runs {
+            for (&info, &pos) in run
+                .buffer
+                .glyph_infos()
+                .iter()
+                .zip(run.buffer.glyph_positions().iter())
+            {
+                res.push(PreLayoutGlyph {
+                    pos,
+                    info,
+                    direction: run.direction,
+                    base_direction: run.base_direction,
+                    end_of_line: false,
+                });
+            }
+        }
+
+        res
+    }
+
     /// Perform text wrap and reshape as needed
-    fn layout_lines<'a>(
+    fn pre_layout_multline<'a>(
         &mut self,
         str: &'a str,
         runs: &'a mut Vec<ShapedRun<'a>>,
@@ -450,6 +528,8 @@ impl<'f> Font<'f> {
                 // TODO: Bidi reordering and actual layout
                 // So we reorder the glyphs right ? accross runs ?
 
+                let first_glyph_of_line = current_line.is_empty();
+
                 current_line.push(GlyphCheckpoint {
                     index: glyph.cluster as usize + run.start,
                     run_index,
@@ -459,7 +539,10 @@ impl<'f> Font<'f> {
                     base_direction: run.base_direction,
                 });
 
-                if x + adv > max_length {
+                // Breaking on the first glyph of the line doesn't make sense because it would just
+                // end up the first glyph of the next line (and overflow there too) causing an
+                // infinite loop
+                if x + adv > max_length && !first_glyph_of_line {
                     // We exceeded the line's max length, we need to break (and potentially
                     // reshape some runs)
 
@@ -648,14 +731,7 @@ impl<'f> Font<'f> {
             }
         }
 
-        let mut meshes = (0..self.textures.len())
-            .map(|i| BuildingMesh {
-                texture: i as u32,
-                indices: Vec::new(),
-                vertices: Vec::new(),
-                empty: true,
-            })
-            .collect_vec();
+        let mut meshes = Vec::<BuildingMesh>::new();
 
         let mut y = 0f32;
         let mut line_start_index = 0;
@@ -704,7 +780,7 @@ impl<'f> Font<'f> {
             let mut x = 0f32;
 
             for g in &lines[line_start_index..i] {
-                let (tc, tex) = self.get_glyph_location(g.info.glyph_id)?;
+                let loc = self.get_glyph_location(g.info.glyph_id)?;
                 let bbox = self
                     .face
                     .glyph_bounding_box(GlyphId(g.info.glyph_id as u16))
@@ -715,18 +791,46 @@ impl<'f> Font<'f> {
 
                 x += g.pos.x_advance as f32 * self.config.scale;
 
+                let Some((tc, tex)) = loc else {
+                    continue;
+                };
+
                 if bbox.width() == 0.0 || bbox.height() == 0.0 {
                     // No point in laying out a glyph that won't get rendered
                     continue;
                 }
 
-                let (w, h) = (bbox.width() * self.config.scale, bbox.height() * self.config.scale);
+                let (w, h) = (
+                    bbox.width() * self.config.scale,
+                    bbox.height() * self.config.scale,
+                );
+
+                if tex as usize >= meshes.len() {
+                    meshes.extend((meshes.len()..=tex as usize).map(|t| BuildingMesh {
+                        vertices: Vec::new(),
+                        indices: Vec::new(),
+                        texture: t as u32,
+                        empty: true,
+                    }));
+                }
 
                 meshes[tex as usize].add_quad([
-                    gx + w, gy + h, tc.x2, tc.y1,
-                    gx, gy + h, tc.x1, tc.y1,
-                    gx, gy, tc.x1, tc.y2,
-                    gx + w, gy, tc.x2, tc.y2,
+                    gx + w,
+                    gy + h,
+                    tc.x2,
+                    tc.y1,
+                    gx,
+                    gy + h,
+                    tc.x1,
+                    tc.y1,
+                    gx,
+                    gy,
+                    tc.x1,
+                    tc.y2,
+                    gx + w,
+                    gy,
+                    tc.x2,
+                    tc.y2,
                 ]);
             }
 
@@ -767,15 +871,10 @@ impl<'f> Font<'f> {
         rustybuzz::shape_with_plan(&self.face, plan, buffer)
     }
 
-    // TODO: remove pub
-
     /// Get a glyph's location in the atlasses, rasterizing it if it isn't already.
-    pub fn get_glyph_location(
-        &mut self,
-        glyph_id: u32,
-    ) -> Result<(BoundingBox<f32>, u32), SMFError> {
+    fn get_glyph_location(&mut self, glyph_id: u32) -> Result<Option<(BoundingBox<f32>, u32)>, SMFError> {
         if let Some((bbox, layer)) = self.packer.get_loc(&glyph_id) {
-            Ok((bbox.map(|v| v as f32 / self.gconf.atlas_size as f32), layer))
+            Ok(Some((bbox.map(|v| v as f32 / self.gconf.atlas_size as f32), layer)))
         } else {
             self.rasterize_glyph(glyph_id)
         }
@@ -866,7 +965,7 @@ impl<'f> Font<'f> {
     }
 
     /// Rasterize a glyph and add it to the atlas, returning its location
-    fn rasterize_glyph(&mut self, raw_glyph_id: u32) -> Result<(BoundingBox<f32>, u32), SMFError> {
+    fn rasterize_glyph(&mut self, raw_glyph_id: u32) -> Result<Option<(BoundingBox<f32>, u32)>, SMFError> {
         let glyph_id = GlyphId(raw_glyph_id as u16);
         let Some(rect) = self.face.glyph_bounding_box(glyph_id) else {
             return if let Some(_) = self.face.glyph_svg_image(glyph_id) {
@@ -878,9 +977,7 @@ impl<'f> Font<'f> {
             } else {
                 // NOTE: This is probably wrong but we'll catch that later
                 // -> We need a way to handle missing glyphs with font fallbacks and what not
-                Err(SMFError::ExtraError(
-                    "Glyph has no outline, no raster and no SVG".to_string(),
-                ))
+                Ok(None)
             };
         };
 
@@ -914,10 +1011,12 @@ impl<'f> Font<'f> {
             RasterKind::MSDF => self.rasterize_msdf(glyph),
         }?;
 
-        Ok((
+        self.textures.record_texture_update(packed_layer, packed);
+
+        Ok(Some((
             packed.map(|v| v as f32 / self.gconf.atlas_size as f32),
             packed_layer,
-        ))
+        )))
     }
 
     pub fn name(&self) -> String {
@@ -996,82 +1095,6 @@ impl OutlineBuilder for Builder {
     fn close(&mut self) {
         if self.last_point != self.first_point {
             self.rasterizer.draw_line(self.last_point, self.last_point);
-        }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::path::Path;
-
-    use crate::config::GlobalConfig;
-
-    use super::Font;
-
-    #[test]
-    fn show_texs() {
-        println!("begin");
-        let mut cfg = GlobalConfig::get_copy();
-
-        cfg.atlas_size = 4096;
-        cfg.sin_alpha = 0.03;
-        cfg.glyph_padding = 8;
-        cfg.coloring_seed = 1234345345654364356;
-
-        cfg.update();
-
-        println!("set gconf");
-
-        let data = &std::fs::read("../src/main/resources/assets/fonts/font.ttc").unwrap();
-        let scale = 1.0 / 8.0;
-
-        let fonts = [
-            Font::from_bytes_and_index(
-                data,
-                0,
-                crate::config::FontConfig {
-                    raster_kind: super::RasterKind::Bitmap,
-                    scale,
-                },
-            )
-            .unwrap(),
-            Font::from_bytes_and_index(
-                data,
-                0,
-                crate::config::FontConfig {
-                    raster_kind: super::RasterKind::SDF,
-                    scale,
-                },
-            )
-            .unwrap(),
-            Font::from_bytes_and_index(
-                data,
-                0,
-                crate::config::FontConfig {
-                    raster_kind: super::RasterKind::MSDF,
-                    scale,
-                },
-            )
-            .unwrap(),
-        ];
-
-        println!("loaded fonts");
-
-        let str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        for (i, mut font) in fonts.into_iter().enumerate() {
-            for c in str.chars() {
-                let id = font.face.glyph_index(c).unwrap_or(ttf_parser::GlyphId(1));
-                println!("font {i} char {c} id {id:?}");
-                font.get_glyph_location(id.0.into()).unwrap();
-            }
-
-            println!("added chars to font {i}");
-
-            let path_str = format!("./tex{i}.png");
-            let path = Path::new(&path_str);
-            font.textures.write_tex(0, path);
-
-            println!("wrote font {i}");
         }
     }
 }

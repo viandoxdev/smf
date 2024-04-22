@@ -21,5 +21,6 @@ parking_lot = "0.12"
 nalgebra = "0.32"
 unicode-script = "0.5"
 itertools = "0.12"
+num-traits = "0.2"
 # this needs to match the one used by fdsm
 image = "0.24"

@@ -1,11 +1,14 @@
+use std::sync::Arc;
+
 use jni::{
     objects::{JObject, JValueGen},
     sys::jobject,
     JNIEnv,
 };
 use parking_lot::Mutex;
+use rustybuzz::Language;
 
-use crate::{error::SMFError, font::RasterKind};
+use crate::{error::SMFError, font::RasterKind, JNI};
 
 #[derive(Clone)]
 pub struct GlobalConfig {
@@ -17,7 +20,7 @@ pub struct GlobalConfig {
     pub sin_alpha: f64,
     /// Coloring seed used in MSDF generation
     pub coloring_seed: u64,
-    set: bool,
+    pub set: bool,
 }
 
 impl Default for GlobalConfig {
@@ -39,31 +42,6 @@ impl GlobalConfig {
             coloring_seed: 0,
             set: false,
         }
-    }
-
-    pub fn from_java(env: &mut JNIEnv, obj: JObject) -> Result<Self, SMFError> {
-        Ok(Self {
-            atlas_size: env.get_field(&obj, "atlasSize", "I")?.i()? as u32,
-            glyph_padding: env.get_field(&obj, "glyphPadding", "I")?.i()? as u32,
-            sin_alpha: env.get_field(&obj, "sinAlpha", "D")?.d()?,
-            coloring_seed: env.get_field(&obj, "coloringSeed", "J")?.j()? as u64,
-            set: false,
-        })
-    }
-
-    pub fn to_java(&self, env: &mut JNIEnv) -> Result<jobject, SMFError> {
-        let class = env.find_class("dev/vndx/bindings/GlobalConfig")?;
-        let obj = env.new_object(
-            &class,
-            "(IIDJ)V",
-            &[
-                JValueGen::Int(self.atlas_size as i32),
-                JValueGen::Int(self.glyph_padding as i32),
-                JValueGen::Double(self.sin_alpha),
-                JValueGen::Long(self.coloring_seed as i64),
-            ],
-        )?;
-        Ok(obj.as_raw())
     }
 
     pub fn update(&self) {
@@ -89,28 +67,6 @@ pub struct FontConfig {
     pub raster_kind: RasterKind,
     pub scale: f32,
     pub line_height: f32,
+    pub language: Arc<Language>,
 }
 
-impl FontConfig {
-    pub fn from_java(env: &mut JNIEnv, obj: JObject) -> Result<Self, SMFError> {
-        Ok(Self {
-            raster_kind: RasterKind::try_from(env.get_field(&obj, "rasterKind", "I")?.i()?)?,
-            scale: env.get_field(&obj, "scale", "F")?.f()?,
-            line_height: env.get_field(&obj, "lineHeight", "F")?.f()?,
-        })
-    }
-
-    pub fn to_java(&self, env: &mut JNIEnv) -> Result<jobject, SMFError> {
-        let class = env.find_class("dev/vndx/bindings/FontConfig")?;
-        let obj = env.new_object(
-            &class,
-            "(IFF)V",
-            &[
-                JValueGen::Int(self.raster_kind as i32),
-                JValueGen::Float(self.scale),
-                JValueGen::Float(self.line_height),
-            ],
-        )?;
-        Ok(obj.as_raw())
-    }
-}

@@ -26,13 +26,19 @@ class SMF {
 
             logger.info("Got direct byte buffer to font data: ${buffer.capacity()}")
 
-            val config = FontConfig(rasterKind = RasterKind.Bitmap, scale = 1.0f, lineHeight = 1.5f)
+            val config = FontConfig(rasterKind = RasterKind.Bitmap, scale = 1.0f, lineHeight = 1.5f, language = "en")
 
             val fonts = Font.load(buffer, config)
 
             for (font in fonts) {
                 logger.info("Loaded font '${font.name} ${font.config}'")
             }
+
+            val font = fonts[0]
+
+            val test = font.processBatched(arrayOf(Command("This is a test string", true, 200f)))
+
+            logger.info("result: ${test}")
         } catch (e: java.io.IOException) {
             throw java.lang.RuntimeException(e)
         }

@@ -14,6 +14,8 @@ pub enum SMFError {
     UnsupportedGlyphFormat,
     #[error("Couldn't fit glyph in atlas")]
     PackingError,
+    #[error("Couldn't parse language string")]
+    LanguageParsingError(&'static str),
     #[error("An unexpected (unreachable) error happened: {0}. Please report this")]
     ExtraError(String),
     #[error("Error with JNI")]
