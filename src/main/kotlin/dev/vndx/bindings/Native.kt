@@ -42,13 +42,19 @@ data class GlobalConfig(val atlasSize: Int, val glyphPadding: Int, val sinAlpha:
 
 data class Command(val string: String, val multiLine: Boolean, val maxLength: Float?)
 
-data class FontConfig(val rasterKind: Int, val scale: Float, val lineHeight: Float, val language: String)
+data class FontConfig(val rasterKind: Int, val scale: Float, val rasterScale: Float, val lineHeight: Float, val language: String)
 
-class Mesh(val tex: Int, val vertices_addr: Long, val vertices_len: Long, val indices_addr: Long, val indices_len: Long) {
+class Mesh(
+    val tex: Int,
+    val vertices_addr: Long,
+    val vertices_len: Long,
+    val indices_addr: Long,
+    val indices_len: Long
+) {
     var destroyed = false
 
     fun destroy() {
-        if(!destroyed) {
+        if (!destroyed) {
             destroyed = true;
             destroyMesh(vertices_addr, vertices_len, indices_addr, indices_len)
         }
@@ -59,9 +65,27 @@ class Mesh(val tex: Int, val vertices_addr: Long, val vertices_len: Long, val in
     }
 }
 
-sealed class Diff {
-    data class TextureUpdate(val tex: Int, val channelCount: Int, val damageMinX: Int, val damageMinY: Int, val damageMaxX: Int, val damageMaxY: Int, val size: Int, val data: Long) : Diff()
-    data class TextureCreation(val tex: Int, val channelCount: Int, val size: Int, val data: Long) : Diff()
+sealed class Diff(val tex: Int, val channelCount: Int) {
+    class TextureUpdate(
+        tex: Int,
+        channelCount: Int,
+        val damageMinX: Int,
+        val damageMinY: Int,
+        val damageMaxX: Int,
+        val damageMaxY: Int,
+        val size: Int,
+        val data: Long
+    ) : Diff(tex, channelCount) {
+        override fun toString(): String {
+            return "TextureUpdate(damageMinX=$damageMinX, damageMinY=$damageMinY, damageMaxX=$damageMaxX, damageMaxY=$damageMaxY, size=$size, data=$data, tex=$tex, channelCount=$channelCount)"
+        }
+    }
+
+    class TextureCreation(tex: Int, channelCount: Int, val size: Int, val data: Long) : Diff(tex, channelCount) {
+        override fun toString(): String {
+            return "TextureCreation(size=$size, data=$data, tex=$tex, channelCount=$channelCount)"
+        }
+    }
 }
 
 data class BatchedResults(val meshes: Array<Array<Mesh>>, val diffs: Array<Diff>)

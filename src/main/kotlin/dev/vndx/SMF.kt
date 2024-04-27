@@ -13,34 +13,6 @@ class SMF {
     fun init(event: FMLInitializationEvent) {
         val logger = LogManager.getLogger()
         loadNativeLibrary(logger)
-
         GlobalConfig(atlasSize = 4096, glyphPadding = 8, sinAlpha = 0.03, coloringSeed = 6942012345678980085).use()
-
-        try {
-            val resource: net.minecraft.client.resources.IResource = Minecraft.getMinecraft().getResourceManager()
-                .getResource(net.minecraft.util.ResourceLocation("fonts:font.ttc"))
-            val bytes = resource.inputStream.readBytes()
-
-            val buffer = ByteBuffer.allocateDirect(bytes.size)
-            buffer.put(bytes)
-
-            logger.info("Got direct byte buffer to font data: ${buffer.capacity()}")
-
-            val config = FontConfig(rasterKind = RasterKind.Bitmap, scale = 1.0f, lineHeight = 1.5f, language = "en")
-
-            val fonts = Font.load(buffer, config)
-
-            for (font in fonts) {
-                logger.info("Loaded font '${font.name} ${font.config}'")
-            }
-
-            val font = fonts[0]
-
-            val test = font.processBatched(arrayOf(Command("This is a test string", true, 200f)))
-
-            logger.info("result: ${test}")
-        } catch (e: java.io.IOException) {
-            throw java.lang.RuntimeException(e)
-        }
     }
 }
