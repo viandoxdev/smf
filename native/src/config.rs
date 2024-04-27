@@ -66,6 +66,7 @@ impl GlobalConfig {
 pub struct FontConfig {
     pub raster_kind: RasterKind,
     pub scale: f32,
+    pub raster_scale: f32,
     pub line_height: f32,
     pub language: Arc<Language>,
 }

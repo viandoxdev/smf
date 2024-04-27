@@ -47,6 +47,7 @@ impl JNI for FontConfig {
         Ok(Self {
             raster_kind: RasterKind::try_from(env.get_field(&obj, "rasterKind", "I")?.i()?)?,
             scale: env.get_field(&obj, "scale", "F")?.f()?,
+            raster_scale: env.get_field(&obj, "rasterScale", "F")?.f()?,
             line_height: env.get_field(&obj, "lineHeight", "F")?.f()?,
             language: Arc::from(
                 Language::from_str(&lang_string).map_err(|e| SMFError::LanguageParsingError(e))?,
@@ -59,10 +60,11 @@ impl JNI for FontConfig {
         let lang = env.new_string(self.language.as_str())?;
         let obj = env.new_object(
             &class,
-            "(IFFLjava/lang/String;)V",
+            "(IFFFLjava/lang/String;)V",
             &[
                 JValueGen::Int(self.raster_kind as i32),
                 JValueGen::Float(self.scale),
+                JValueGen::Float(self.raster_scale),
                 JValueGen::Float(self.line_height),
                 JValueGen::Object(&lang),
             ],
